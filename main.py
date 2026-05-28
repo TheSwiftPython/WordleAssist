@@ -1,178 +1,479 @@
+from collections import Counter, defaultdict
 import itertools
+import string
 import os
-import concurrent.futures
-from functools import partial
+import re
 
-# Default file paths
+# =========================================================
+# CONFIG
+# =========================================================
+
 DICTIONARY_FILE = "words.txt"
-OUTPUT_FILE = "output.txt"
 ILLEGAL_COMBOS_FILE = "illegalcombos.txt"
+OUTPUT_FILE = "output.txt"
 
-# --- Word checking ---
+# Maximum combinations allowed before refusing generation
+MAX_GENERATION_SIZE = 500_000
+
+# =========================================================
+# CONSTRAINT CLASS
+# =========================================================
+
+class WordConstraints:
+
+    def __init__(self, word_length):
+
+        self.word_length = word_length
+
+        self.excluded = set()
+
+        self.required = defaultdict(int)
+
+        self.known_positions = {}
+
+        self.forbidden_positions = defaultdict(set)
+
+    def update_from_feedback(self, guess, result):
+
+        guess = guess.lower()
+        result = result.lower()
+
+        local_required = Counter()
+
+        # Greens and yellows
+        for i, (letter, status) in enumerate(zip(guess, result)):
+
+            if status == "g":
+
+                self.known_positions[i] = letter
+                local_required[letter] += 1
+
+            elif status == "y":
+
+                self.forbidden_positions[i].add(letter)
+                local_required[letter] += 1
+
+        # Required counts
+        for letter, count in local_required.items():
+
+            self.required[letter] = max(
+                self.required[letter],
+                count
+            )
+
+        # Blacks
+        for i, (letter, status) in enumerate(zip(guess, result)):
+
+            if status == "b":
+
+                if letter in self.required:
+                    self.forbidden_positions[i].add(letter)
+                else:
+                    self.excluded.add(letter)
+
+    def display(self):
+
+        print("\n=== Current Constraints ===")
+
+        print(f"Excluded Letters: {sorted(self.excluded)}")
+        print(f"Required Letters: {dict(self.required)}")
+        print(f"Known Positions: {self.known_positions}")
+
+        print("Forbidden Positions:")
+
+        for pos, letters in self.forbidden_positions.items():
+            print(f"  Position {pos}: {sorted(letters)}")
+
+# =========================================================
+# FILE LOADERS
+# =========================================================
+
 def load_dictionary(word_length):
-    """Load dictionary words of the given length."""
+
     if not os.path.exists(DICTIONARY_FILE):
-        print(f"[!] Dictionary file '{DICTIONARY_FILE}' not found. Using brute force.")
-        return None
-    with open(DICTIONARY_FILE, "r") as f:
-        words = {line.strip().lower() for line in f if len(line.strip()) == word_length}
-    print(f"Loaded {len(words)} words from dictionary.")
+
+        print(f"[!] Dictionary file '{DICTIONARY_FILE}' not found.")
+        return []
+
+    words = []
+
+    with open(DICTIONARY_FILE, "r", encoding="utf-8") as f:
+
+        for line in f:
+
+            word = line.strip().lower()
+
+            if len(word) == word_length and word.isalpha():
+                words.append(word)
+
+    print(f"Loaded {len(words)} dictionary words.")
+
     return words
 
+
 def load_illegal_combos():
-    """Load forbidden 2-letter combinations."""
+
     if not os.path.exists(ILLEGAL_COMBOS_FILE):
         return set()
+
     combos = set()
-    with open(ILLEGAL_COMBOS_FILE, "r") as f:
+
+    with open(ILLEGAL_COMBOS_FILE, "r", encoding="utf-8") as f:
+
         for line in f:
+
             pair = line.strip().lower()
+
             if len(pair) == 2:
                 combos.add(pair)
-    print(f"Loaded {len(combos)} illegal 2-letter combinations.")
+
+    print(f"Loaded {len(combos)} illegal combinations.")
+
     return combos
 
-def check_word(word, excluded_letters, required_letters, known_positions, forbidden_positions, dictionary=None, illegal_combos=None):
-    """Return True if word passes all constraints."""
-    if dictionary is not None and word not in dictionary:
+# =========================================================
+# LEGAL POSITION GENERATION
+# =========================================================
+
+def build_legal_positions(word_length, constraints):
+
+    alphabet = set(string.ascii_lowercase)
+
+    legal_positions = []
+
+    for pos in range(word_length):
+
+        legal = alphabet.copy()
+
+        # Remove excluded letters
+        legal -= constraints.excluded
+
+        # Known positions override everything
+        if pos in constraints.known_positions:
+            legal = {constraints.known_positions[pos]}
+
+        # Remove forbidden letters
+        if pos in constraints.forbidden_positions:
+            legal -= constraints.forbidden_positions[pos]
+
+        legal_positions.append(sorted(legal))
+
+    return legal_positions
+
+
+def estimate_search_space(legal_positions):
+
+    total = 1
+
+    for letters in legal_positions:
+        total *= len(letters)
+
+    return total
+
+
+def generate_possible_words(legal_positions):
+
+    return (
+        ''.join(combo)
+        for combo in itertools.product(*legal_positions)
+    )
+
+# =========================================================
+# FILTERING
+# =========================================================
+
+def build_regex(constraints):
+
+    pattern = []
+
+    for i in range(constraints.word_length):
+
+        if i in constraints.known_positions:
+            pattern.append(constraints.known_positions[i])
+        else:
+            pattern.append(".")
+
+    return re.compile("^" + "".join(pattern) + "$")
+
+
+
+def check_word(word, constraints, illegal_combos, regex):
+
+    # Regex match
+    if not regex.match(word):
         return False
-    if any(ch in excluded_letters for ch in word):
+
+    # Excluded letters
+    if any(letter in constraints.excluded for letter in word):
         return False
-    if not all(ch in word for ch in required_letters):
-        return False
-    for i, c in enumerate(known_positions):
-        if c is not None and word[i] != c:
+
+    # Forbidden positions
+    for pos, forbidden in constraints.forbidden_positions.items():
+
+        if word[pos] in forbidden:
             return False
-    for letter, positions in forbidden_positions.items():
-        for pos in positions:
-            if pos < len(word) and word[pos] == letter:
-                return False
+
+    # Required counts
+    counts = Counter(word)
+
+    for letter, needed in constraints.required.items():
+
+        if counts[letter] < needed:
+            return False
+
+    # Illegal combinations
     if illegal_combos:
-        for i in range(len(word)-1):
-            if word[i:i+2].lower() in illegal_combos:
-                return False
+
+        if any(a + b in illegal_combos for a, b in zip(word, word[1:])):
+            return False
+
     return True
 
-def filter_chunk(chunk, excluded_letters, required_letters, known_positions, forbidden_positions, dictionary, illegal_combos):
+
+
+
+def filter_words(words, constraints, illegal_combos):
+
+    regex = build_regex(constraints)
+
     return [
-        w for w in chunk
-        if check_word(w, excluded_letters, required_letters, known_positions, forbidden_positions, dictionary, illegal_combos)
+        word
+        for word in words
+        if check_word(word, constraints, illegal_combos, regex)
     ]
 
-def save_words(possible_words):
-    with open(OUTPUT_FILE, "w") as f:
-        for w in possible_words:
-            f.write(w + "\n")
+# =========================================================
+# SAVE RESULTS
+# =========================================================
 
-# --- Main Interactive Loop ---
+def save_words(words):
+
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+
+        for word in words:
+            f.write(word + "\n")
+
+# =========================================================
+# MAIN PROGRAM
+# =========================================================
+
 def main():
-    print("=== Wordle Helper Interactive (Persistent Constraints) ===")
-    word_length = int(input("Enter word length: "))
-    use_dict = input("Use dictionary? (y/n): ").strip().lower()
 
-    if use_dict == "y":
-        dictionary = load_dictionary(word_length)
-        possible_words = list(dictionary)
-        use_bruteforce = False
-    else:
-        dictionary = None
-        possible_words = None  # don’t prebuild yet
-        use_bruteforce = True
+    print("=== Smart Wordle Helper ===")
 
     illegal_combos = load_illegal_combos()
 
-    # Persistent constraints
-    master_excluded = set()
-    master_required = set()
-    master_known_positions = [None] * word_length
-    master_forbidden_positions = {}
-
-    turn = 1
     while True:
-        print(f"\n--- Turn {turn} ---")
-        # User input for this turn
-        excluded_letters = set(input("Letters NOT in the word (grays): ").strip().lower())
-        required_letters = set(input("Letters that must be in the word (anywhere): ").strip().lower())
-        known_positions_input = input(f"Known letters (greens), '_' for unknown: ").strip().lower()
-        known_positions = [c if c != "_" else None for c in known_positions_input.ljust(word_length, "_")]
 
-        forbidden_positions = {}
+        try:
+            word_length = int(input("\nEnter word length: "))
+        except ValueError:
+            print("Invalid number.")
+            continue
+
+        constraints = WordConstraints(word_length)
+
+        use_dictionary = input(
+            "Use dictionary? (y/n): "
+        ).strip().lower() == "y"
+
+        dictionary = None
+
+        if use_dictionary:
+
+            dictionary = load_dictionary(word_length)
+
+            if not dictionary:
+                continue
+
+        turn = 1
+
         while True:
-            fp = input("Yellow letters with forbidden positions (e.g., r:0,2), blank to finish: ").strip().lower()
-            if not fp:
-                break
-            try:
-                letter, positions = fp.split(":")
-                positions = [int(p) for p in positions.split(",")] if "," in positions else [int(positions)]
-                if letter in forbidden_positions:
-                    forbidden_positions[letter].extend(positions)
-                else:
-                    forbidden_positions[letter] = positions
-            except Exception:
-                print("Invalid format, try again.")
 
-        # Merge into master constraints
-        master_excluded.update(excluded_letters)
-        master_required.update(required_letters)
-        for i in range(word_length):
-            if known_positions[i] is not None:
-                master_known_positions[i] = known_positions[i]
-        for letter, positions in forbidden_positions.items():
-            if letter in master_forbidden_positions:
-                master_forbidden_positions[letter].extend(positions)
-            else:
-                master_forbidden_positions[letter] = positions
+            print(f"\n========== TURN {turn} ==========")
 
-        # Build brute force only after we have constraints
-        if use_bruteforce and possible_words is None:
-            print("[*] Generating brute force candidates on the fly…")
-            alphabet = "abcdefghijklmnopqrstuvwxyz"
-            # Instead of prebuilding the list, stream and filter immediately
-            def generate_candidates():
-                for p in itertools.product(alphabet, repeat=word_length):
-                    yield "".join(p)
+            # Build legal positions
+            legal_positions = build_legal_positions(
+                word_length,
+                constraints
+            )
 
-            candidates = generate_candidates()
-            # Filter as we stream:
-            possible_words = [
-                w for w in candidates
-                if check_word(w, master_excluded, master_required,
-                              master_known_positions, master_forbidden_positions,
-                              dictionary, illegal_combos)
-            ]
-        else:
-            # Normal filtering on existing possible_words
-            chunk_size = max(1, len(possible_words) // os.cpu_count())
-            chunks = [possible_words[i:i+chunk_size] for i in range(0, len(possible_words), chunk_size)]
+            estimated = estimate_search_space(
+                legal_positions
+            )
 
-            with concurrent.futures.ProcessPoolExecutor() as executor:
-                func = partial(
-                    filter_chunk,
-                    excluded_letters=master_excluded,
-                    required_letters=master_required,
-                    known_positions=master_known_positions,
-                    forbidden_positions=master_forbidden_positions,
-                    dictionary=dictionary,
-                    illegal_combos=illegal_combos
+            print(f"Estimated combinations: {estimated}")
+
+            # Too large to generate
+            if not use_dictionary and estimated > MAX_GENERATION_SIZE:
+
+                print(
+                    "\nToo many combinations to generate safely."
                 )
-                results = executor.map(func, chunks)
 
-            possible_words = [w for sublist in results for w in sublist]
+                print(
+                    "Apply more restrictions first."
+                )
 
-        save_words(possible_words)
+                constraints.display()
 
-        print(f"\nPossible words remaining: {len(possible_words)}")
-        if len(possible_words) <= 20:
-            print(possible_words)
-        else:
-            print("Too many to display. Check output.txt.")
+            else:
 
-        cont = input("Continue to next turn? (y/n): ").strip().lower()
-        if cont != "y":
-            break
-        turn += 1
+                # Generate words
+                if use_dictionary:
 
-    print(f"\nGame ended. Possible words saved to '{OUTPUT_FILE}'.")
+                    possible_words = filter_words(
+                        dictionary,
+                        constraints,
+                        illegal_combos
+                    )
+
+                else:
+
+                    generated_words = generate_possible_words(
+                        legal_positions
+                    )
+
+                    regex = build_regex(constraints)
+
+                    possible_words = [
+                        word
+                        for word in generated_words
+                        if check_word(
+                            word,
+                            constraints,
+                            illegal_combos,
+                            regex
+                        )
+                    ]
+
+                print(
+                    f"\nPossible words remaining: "
+                    f"{len(possible_words)}"
+                )
+
+                save_words(possible_words)
+
+                if len(possible_words) <= 100:
+                    print(possible_words)
+                else:
+                    print(
+                        f"Results saved to '{OUTPUT_FILE}'"
+                    )
+
+                constraints.display()
+
+            # =================================================
+            # USER INPUT
+            # =================================================
+
+            command = input(
+                "\nEnter guess "
+                "(or manual/reset/exit): "
+            ).strip().lower()
+
+            if command == "exit":
+                return
+
+            if command == "reset":
+                break
+
+            # =================================================
+            # MANUAL MODE
+            # =================================================
+
+            if command == "manual":
+
+                excluded = input(
+                    "Excluded letters: "
+                ).strip().lower()
+
+                constraints.excluded.update(excluded)
+
+                required = input(
+                    "Required letters "
+                    "(example a2,b1): "
+                ).strip().lower()
+
+                if required:
+
+                    for item in required.split(","):
+
+                        item = item.strip()
+
+                        letter = item[0]
+                        count = int(item[1:])
+
+                        constraints.required[letter] = max(
+                            constraints.required[letter],
+                            count
+                        )
+
+                known = input(
+                    "Known positions "
+                    "(example a0,b3): "
+                ).strip().lower()
+
+                if known:
+
+                    for item in known.split(","):
+
+                        item = item.strip()
+
+                        letter = item[0]
+                        pos = int(item[1:])
+
+                        constraints.known_positions[pos] = letter
+
+                forbidden = input(
+                    "Forbidden positions "
+                    "(example a2,b4): "
+                ).strip().lower()
+
+                if forbidden:
+
+                    for item in forbidden.split(","):
+
+                        item = item.strip()
+
+                        letter = item[0]
+                        pos = int(item[1:])
+
+                        constraints.forbidden_positions[pos].add(letter)
+
+            # =================================================
+            # WORDLE FEEDBACK MODE
+            # =================================================
+
+            else:
+
+                guess = command
+
+                if len(guess) != word_length:
+
+                    print("Guess length mismatch.")
+                    continue
+
+                result = input(
+                    "Enter result (g/y/b): "
+                ).strip().lower()
+
+                if len(result) != word_length:
+
+                    print("Result length mismatch.")
+                    continue
+
+                if any(c not in "gyb" for c in result):
+
+                    print("Only g/y/b allowed.")
+                    continue
+
+                constraints.update_from_feedback(
+                    guess,
+                    result
+                )
+
+            turn += 1
 
 
 if __name__ == "__main__":
