@@ -15,6 +15,7 @@ OUTPUT_FILE = "output.txt"
 # Maximum combinations allowed before refusing generation
 MAX_GENERATION_SIZE = 500_000
 
+
 # =========================================================
 # CONSTRAINT CLASS
 # =========================================================
@@ -258,6 +259,8 @@ def save_words(words):
 # =========================================================
 
 def main():
+    # Allow force generation
+    force_generate = False
 
     print("=== Smart Wordle Helper ===")
 
@@ -305,7 +308,12 @@ def main():
             print(f"Estimated combinations: {estimated}")
 
             # Too large to generate
-            if not use_dictionary and estimated > MAX_GENERATION_SIZE:
+            # Too large to generate
+            if (
+                not use_dictionary
+                and estimated > MAX_GENERATION_SIZE
+                and not force_generate
+            ):
 
                 print(
                     "\nToo many combinations to generate safely."
@@ -362,6 +370,7 @@ def main():
                     )
 
                 constraints.display()
+                force_generate = False
 
             # =================================================
             # USER INPUT
@@ -369,7 +378,7 @@ def main():
 
             command = input(
                 "\nEnter guess "
-                "(or manual/reset/exit): "
+                "(or manual/reset/force/exit): "
             ).strip().lower()
 
             if command == "exit":
@@ -377,6 +386,22 @@ def main():
 
             if command == "reset":
                 break
+
+
+
+            if command == "force":
+
+                if use_dictionary:
+                    print("Force mode is only needed for generated words.")
+                else:
+                    force_generate = True
+                    print(
+                        "\nForce generation enabled."
+                        "\nThe next generation may take a long time"
+                        " and consume significant memory."
+                    )
+
+                continue
 
             # =================================================
             # MANUAL MODE
